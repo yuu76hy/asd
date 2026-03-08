@@ -1,0 +1,305 @@
+name: Docker持续运行（Tailscale内网版 拉取即删 自动续跑）
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [renew_docker_snapshot]
+
+jobs:
+  docker-continuous:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    env:
+      DOCKER_DATA_DIRS: "/var/lib/docker /etc/docker /var/lib/containerd"
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      REPO: ${{ secrets.REPO }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      SSH_USER: "root"
+      SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
+      REMOTE_BACKUP_BASE: "/aaa"
+      LOCAL_BACKUP_DIR: "/tmp/docker-backup"
+      TARGET_RUN_MINUTES: 300
+      RETRY_TIMES: 2
+      ZSTD_COMPRESS_LEVEL: 5
+      SSH_OPTIONS: "-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o Compression=no -o TCPKeepAlive=no"
+      TAILSCALE_UP_TIMEOUT: 10
+
+    steps:
+      - name: 1-系统初始化 + 工具安装
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 1-系统初始化 + 工具安装 开始 ====="
+          sudo apt update -y -qq -o Acquire::Retries=2 || true
+          sudo apt install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd || true
+          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* || true
+          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
+          sudo systemctl enable --now ssh || true
+          echo "✅ [日志] 1-系统初始化完成"
+          echo "===== [日志] 1-步骤结束 =====\n"
+
+      - name: 2-安装Docker
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 2-安装Docker 开始 ====="
+          if ! command -v docker &> /dev/null; then
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
+          sudo usermod -aG docker root 2>/dev/null || true
+          sudo systemctl enable --now docker containerd || true
+          docker --version
+          echo "✅ [日志] 2-Docker安装完成"
+          echo "===== [日志] 2-步骤结束 =====\n"
+
+      - name: 3-启用 root 账户并设置密码
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 3-启用 root 账户并设置密码 开始 ====="
+          [ -z "$SSH_PASS" ] && { echo "❌ [日志] 错误：ROOTS_PASSWORD 未配置，退出本步骤"; exit 0; }
+          echo "root:$SSH_PASS" | sudo chpasswd || true
+          sudo sed -i -e 's/^#PermitRootLogin.*/PermitRootLogin yes/' \
+                      -e 's/^PermitRootLogin.*/PermitRootLogin yes/' \
+                      -e 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' \
+                      -e 's/^PasswordAuthentication.*/PasswordAuthentication yes/' \
+                      /etc/ssh/sshd_config 2>/dev/null || true
+          sudo systemctl restart ssh || true
+          echo "✅ [日志] 3-root 账户已启用，密码配置完成"
+          echo "===== [日志] 3-步骤结束 =====\n"
+
+      - name: 4-Tailscale 组网+上线
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 4-Tailscale组网 开始 ====="
+          [ -z "$TAILSCALE_AUTH_KEY" ] && { echo "⚠️ [日志] Tailscale 未配置，跳过组网"; exit 0; }
+          curl -fsSL https://tailscale.com/install.sh | sudo bash -s -- --yes || true
+          sudo systemctl enable --now tailscaled && sleep 2 || true
+          TS_HOSTNAME="Docker-$((RANDOM % 1000))"
+          echo "[日志] 本次 Tailscale 主机名：${TS_HOSTNAME}"
+          timeout $TAILSCALE_UP_TIMEOUT sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes --reset || true
+          echo -e "\n[日志] === 🖥️ 本机 IP 信息 ==="
+          echo "[日志] 物理内网IP: $(hostname -I | awk '{print $1}')"
+          echo "[日志] Tailscale内网IP: $(sudo tailscale ip -4 2>/dev/null || echo "获取失败")"
+          echo "===================================\n"
+          echo "✅ [日志] 4-Tailscale 组网上线完成"
+          echo "===== [日志] 4-步骤结束 =====\n"
+
+      - name: 5-多节点尝试拉取备份（拉取即删）
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 5-多节点尝试拉取备份 开始 ====="
+          [ -z "$TAILSCALE_AUTH_KEY" ] || [ -z "$SSH_PASS" ] && { echo "ℹ️ [日志] 未配置 Tailscale/SSH，纯净启动"; exit 0; }
+          TS_STATUS_JSON=$(sudo tailscale status --json 2>/dev/null || true)
+          TARGET_LIST=$(echo "$TS_STATUS_JSON" | jq -r '
+            .Peer[] | select(.Online == true and .ID != .Self.ID and (.HostName | ascii_downcase | contains("docker"))) |
+            "\(.HostName // "unknown")|\(.TailscaleIPs[0] // "no-ip")|\(.Online)"
+          ' 2>/dev/null || true)
+          [ -z "$TARGET_LIST" ] && { echo "ℹ️ [日志] 未找到符合条件节点，纯净启动"; exit 0; }
+          echo -e "\n[日志] 符合条件节点："
+          echo "$TARGET_LIST" | while IFS='|' read -r h ip online; do echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"; done
+
+          echo -e "\n[日志] 停止 Docker 以安全恢复..."
+          sudo systemctl stop docker containerd 2>/dev/null || sudo pkill -9 "docker" "containerd" 2>/dev/null
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null
+          sync && sleep 1
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" && sudo chmod 777 "$LOCAL_BACKUP_DIR"
+          RESTORE_SUCCESS=0
+
+          while IFS='|' read -r TARGET_HOST TARGET_IP TARGET_ONLINE; do
+            echo -e "\n==========================================================="
+            echo "[日志] 🎯 尝试节点：$TARGET_HOST | $TARGET_IP"
+            echo "==========================================================="
+            LATEST_FILE=$(timeout 10 sshpass -p "$SSH_PASS" ssh $SSH_OPTIONS "$SSH_USER@$TARGET_IP" "ls -t '$REMOTE_BACKUP_BASE'/docker-*.tar.zst 2>/dev/null | head -1" || true)
+            [ -z "$LATEST_FILE" ] && { echo "[日志] ⚠️ 无备份，跳过"; continue; }
+            LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
+
+            if sudo sshpass -p "$SSH_PASS" scp $SSH_OPTIONS "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE"; then
+              sshpass -p "$SSH_PASS" ssh $SSH_OPTIONS "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST_FILE'" 2>/dev/null
+              echo "[日志] 🔧 开始解压恢复（极速模式）"
+              sudo tar --zstd --fast-read -xf "$LOCAL_FILE" -C / --overwrite 2>/dev/null
+
+              for dir in $DOCKER_DATA_DIRS; do
+                [ -d "$dir" ] && sudo chown -R root:root "$dir" && sudo chmod -R 755 "$dir" 2>/dev/null
+              done
+              [ -d "/var/lib/docker" ] && sudo chmod -R 700 /var/lib/docker 2>/dev/null
+
+              echo -e "\n[日志] 🎉 节点 $TARGET_HOST 恢复成功！"
+              RESTORE_SUCCESS=1
+              break
+            else
+              echo "[日志] ⚠️ 拉取失败/文件无效"
+              rm -f "$LOCAL_FILE" 2>/dev/null
+              continue
+            fi
+          done < <(echo "$TARGET_LIST")
+
+          [ $RESTORE_SUCCESS -ne 1 ] && echo -e "\n[日志] ❌ 所有节点均失败，纯净启动"
+          echo -e "\n✅ [日志] 5-恢复流程完成"
+          echo "===== [日志] 5-步骤结束 =====\n"
+
+      - name: 6-启动 Docker 服务
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 6-启动 Docker 服务 开始 ====="
+          sudo mkdir -p /run/docker 2>/dev/null || true
+          sudo systemctl daemon-reload || true
+          sudo systemctl enable --now docker containerd && sleep 3 || true
+          docker info
+          echo "✅ [日志] 6-Docker 服务启动完成"
+          echo "===== [日志] 6-步骤结束 =====\n"
+
+      - name: 7-部署Docker服务（可选）
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 7-部署Docker服务 开始 ====="
+          
+          # 如果有docker-compose.yml则启动
+          if [ -f "docker-compose.yml" ]; then
+            docker compose up -d || true
+            echo "[日志] docker-compose服务已启动"
+          fi
+          
+          # 显示运行中的容器
+          echo -e "\n[日志] 当前运行的容器："
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+          
+          echo "✅ [日志] 7-Docker服务部署完成"
+          echo "===== [日志] 7-步骤结束 =====\n"
+
+      - name: 8-稳定运行指定分钟
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 8-稳定运行 $TARGET_RUN_MINUTES 分钟 开始 ====="
+          RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
+          echo "[日志] 总等待秒数：$RUN_SECONDS"
+          
+          # 每60秒检查一次Docker状态
+          ELAPSED=0
+          while [ $ELAPSED -lt $RUN_SECONDS ]; do
+            sleep 60 || true
+            ELAPSED=$((ELAPSED + 60))
+            REMAINING=$((RUN_SECONDS - ELAPSED))
+            
+            # 检查Docker状态
+            if ! docker info &>/dev/null; then
+              echo "[日志] ⚠️ Docker异常，尝试重启..."
+              sudo systemctl restart docker || true
+            fi
+            
+            # 显示运行状态
+            RUNNING=$(docker ps -q 2>/dev/null | wc -l)
+            echo "[日志] 运行中: $((ELAPSED / 60))分钟 / $TARGET_RUN_MINUTES 分钟 | 容器数: $RUNNING"
+          done
+          
+          echo "✅ [日志] 8-稳定运行完成"
+          echo "===== [日志] 8-步骤结束 =====\n"
+
+      - name: 9-停止业务服务（保留Tailscale）
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 9-停止业务服务 开始 ====="
+          sudo systemctl stop docker containerd 2>/dev/null || sudo pkill -9 "docker" "containerd" 2>/dev/null
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null
+          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
+          sync && sleep 1
+          echo "✅ [日志] 9-业务服务已停止"
+          echo "===== [日志] 9-步骤结束 =====\n"
+
+      - name: 10-本地全量备份
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 10-生成本地全量备份 开始 ====="
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
+          IFS=' ' read -r -a DIR_ARRAY <<< "$DOCKER_DATA_DIRS"
+          for dir in "${DIR_ARRAY[@]}"; do [ ! -d "$dir" ] && sudo mkdir -p "$dir" || true; done
+          SNAP_NAME="docker-full-$(date +%Y%m%d-%H%M%S).tar.zst"
+          LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
+          echo "[日志] 备份文件：$SNAP_NAME"
+          sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" --fast-read --no-acls --ignore-failed-read -cf "$LOCAL_FILE" "${DIR_ARRAY[@]}" 2>/dev/null
+
+          if [ -f "$LOCAL_FILE" ] && [ $(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0) -gt 1024 ]; then
+            echo "[日志] ✅ 备份有效"
+            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV || true
+            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV || true
+          else
+            echo "[日志] ❌ 备份文件无效"
+            exit 0
+          fi
+          echo "✅ [日志] 10-备份完成"
+          echo "===== [日志] 10-步骤结束 =====\n"
+
+      - name: 11-触发下一轮续跑
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 11-触发下一轮续跑 开始 ====="
+          [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "⚠️ [日志] 未配置 PAT/REPO，跳过"; exit 0; }
+          RETRY_DISPATCH_TIMES=3
+          DISPATCH_WAIT_SECONDS=5
+          WORKFLOW_NAME="Docker持续运行（Tailscale内网版 拉取即删 自动续跑）"
+          DISPATCH_SUCCESS=0
+
+          for ((retry=1; retry<=RETRY_DISPATCH_TIMES; retry++)); do
+            echo -e "\n[日志] 第 $retry 次触发续跑..."
+            curl -s -f -X POST -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" \
+              https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_docker_snapshot"}' >/dev/null 2>&1
+            sleep $DISPATCH_WAIT_SECONDS || true
+
+            WF_ID=$(curl -s -H "Authorization: token $USER_PAT" "https://api.github.com/repos/$REPO/actions/workflows?per_page=15" | \
+              jq -r --arg name "$WORKFLOW_NAME" '.workflows[] | select(.name == $name) | .id' | head -1 2>/dev/null)
+            if [ -n "$WF_ID" ]; then
+              RUN_STATUS=$(curl -s -H "Authorization: token $USER_PAT" "https://api.github.com/repos/$REPO/actions/workflows/$WF_ID/runs?per_page=5" | \
+                jq -r '.workflow_runs[] | select(.status == "queued" or .status == "in_progress") | .status' | head -1 2>/dev/null)
+              if [ "$RUN_STATUS" = "queued" ] || [ "$RUN_STATUS" = "in_progress" ]; then
+                echo "✅ [日志] 续跑校验成功！当前任务状态：$RUN_STATUS"
+                DISPATCH_SUCCESS=1
+                break
+              fi
+            fi
+            echo "[日志] 第 $retry 次未检测到有效任务，${DISPATCH_WAIT_SECONDS}秒后重试..."
+          done
+
+          [ $DISPATCH_SUCCESS -eq 1 ] && echo "🎉 [日志] 续跑最终确认成功！" || echo "❌ [日志] 重试 $RETRY_DISPATCH_TIMES 次仍未成功"
+          echo "===== [日志] 11-步骤结束 =====\n"
+
+      - name: 12-移入/aaa并无限轮询检测删除
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 12-备份移入/aaa + 无限轮询删除 开始 ====="
+          [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ] && { echo "ℹ️ [日志] 无备份文件，跳过"; exit 0; }
+          LOCAL_AAA="/aaa"
+          sudo mkdir -p "$LOCAL_AAA" || true
+          TARGET_FILE="$LOCAL_AAA/$SNAP_NAME"
+          sudo mv -f "$BACKUP_FILE" "$TARGET_FILE" 2>/dev/null || true
+          echo -e "\n[日志] ⌛ 无限轮询：文件被删除即退出，进入下一轮"
+
+          while [ -f "$TARGET_FILE" ]; do
+            sleep 60 || true
+          done
+
+          echo "[日志] 🎉 文件已被拉取删除，退出轮询"
+          echo "✅ [日志] 12-轮询结束"
+          echo "===== [日志] 12-步骤结束 =====\n"
+
+      - name: 13-最终清理+关闭Tailscale
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 13-最终清理 + 关闭Tailscale 开始 ====="
+          sudo systemctl stop tailscaled 2>/dev/null || sudo pkill -9 "tailscaled" 2>/dev/null
+          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* /etc/sudoers.d/roots 2>/dev/null || true
+          sudo apt autoremove -y -qq && sudo apt clean -y -qq 2>/dev/null || true
+          echo "✅ [日志] 13-清理完成，Tailscale 已关闭"
+          echo "🎉 [日志] 全流程正常结束"
+          echo "===== [日志] 13-步骤结束 =====\n"
