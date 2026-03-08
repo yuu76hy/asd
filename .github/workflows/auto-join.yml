@@ -1,0 +1,110 @@
+name: Auto Join New Codespace
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_number:
+        description: '节点编号 (留空自动检测)'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [codespace-created]
+
+jobs:
+  join-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+          
+      - name: Detect node number
+        id: detect
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "${{ github.event.inputs.node_number }}" ]; then
+            NEXT_NUM="${{ github.event.inputs.node_number }}"
+          else
+            EXISTING=$(curl -s -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/${{ github.repository }}/codespaces" | \
+              jq -r '.codespaces[].display_name' 2>/dev/null | grep "docker" | sort -V | tail -1 || echo "docker0")
+            CURRENT_NUM=$(echo "$EXISTING" | grep -oE '[0-9]+$' || echo "0")
+            NEXT_NUM=$((CURRENT_NUM + 1))
+          fi
+          echo "NEXT_NUM=$NEXT_NUM" >> $GITHUB_OUTPUT
+          echo "检测到下一个节点编号: docker$NEXT_NUM"
+          
+      - name: Install Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker $USER
+          
+      - name: Install Tailscale
+        env:
+          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "$TS_AUTH_KEY" --hostname "docker${{ steps.detect.outputs.NEXT_NUM }}" --accept-dns=false
+          
+      - name: Join Swarm cluster
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          NEXT_NUM=${{ steps.detect.outputs.NEXT_NUM }}
+          NODE_NAME="docker${NEXT_NUM}"
+          
+          sudo hostnamectl set-hostname "$NODE_NAME"
+          echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
+          
+          MANAGER_IPS=("100.64.0.1" "100.64.0.3" "100.64.0.5")
+          
+          for IP in "${MANAGER_IPS[@]}"; do
+            if ping -c 1 -W 2 "$IP" > /dev/null 2>&1; then
+              MANAGER_IP="$IP"
+              break
+            fi
+          done
+          
+          if [ -z "$MANAGER_IP" ]; then
+            echo "错误: 无法连接到任何Manager节点"
+            exit 1
+          fi
+          
+          if [ $((NEXT_NUM % 2)) -eq 1 ]; then
+            ROLE="manager"
+          else
+            ROLE="worker"
+          fi
+          
+          JOIN_TOKEN=$(ssh -o StrictHostKeyChecking=no docker@"$MANAGER_IP" "docker swarm join-token $ROLE -q" 2>/dev/null || echo "")
+          
+          if [ -z "$JOIN_TOKEN" ]; then
+            echo "警告: 无法获取加入令牌，尝试使用存储的令牌"
+            exit 1
+          fi
+          
+          docker swarm join --token "$JOIN_TOKEN" "$MANAGER_IP":2377
+          
+      - name: Setup GlusterFS
+        run: |
+          sudo apt-get install -y glusterfs-client
+          sudo mkdir -p /mnt/gluster
+          
+          for IP in "100.64.0.1" "100.64.0.3" "100.64.0.5"; do
+            if ping -c 1 -W 2 "$IP" > /dev/null 2>&1; then
+              sudo mount -t glusterfs "$IP":/workflow-data /mnt/gluster && break
+            fi
+          done
+          
+      - name: Verify join
+        run: |
+          echo "节点加入状态:"
+          docker node ls
+          echo ""
+          echo "GlusterFS挂载:"
+          df -h /mnt/gluster 2>/dev/null || echo "未挂载"
