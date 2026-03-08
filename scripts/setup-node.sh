@@ -11,8 +11,8 @@ NODE_NUM=$1
 NODE_NAME="docker${NODE_NUM}"
 
 # 从环境变量或使用默认值
-CLUSTER_USER=${CLUSTER_USER:-dockeradmin}
-CLUSTER_PASSWORD=${CLUSTER_PASSWORD:-dockeradmin123}
+CLUSTER_USER=${CLUSTER_USER:-root}
+CLUSTER_PASSWORD=${CLUSTER_PASSWORD:-root123456}
 TS_AUTH_KEY=${TS_AUTH_KEY:-}
 SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
 
@@ -28,19 +28,15 @@ echo "1️⃣ 设置系统主机名..."
 sudo hostnamectl set-hostname "$NODE_NAME"
 echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
 
-# 2. 创建用户
-echo "2️⃣ 创建系统用户..."
-if ! id "$CLUSTER_USER" &>/dev/null; then
-    sudo useradd -m -s /bin/bash "$CLUSTER_USER"
-    echo "$CLUSTER_USER:$CLUSTER_PASSWORD" | sudo chpasswd
-    sudo usermod -aG docker,sudo "$CLUSTER_USER"
-    echo "✅ 用户 $CLUSTER_USER 已创建"
-else
-    echo "$CLUSTER_USER:$CLUSTER_PASSWORD" | sudo chpasswd
-    echo "✅ 用户 $CLUSTER_USER 密码已更新"
-fi
+# 2. 配置root用户密码
+echo "2️⃣ 配置root用户密码..."
+echo "root:$CLUSTER_PASSWORD" | sudo chpasswd
+sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+sudo sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
+echo "✅ root用户密码已设置"
 
-# 3. 配置SSH
+# 3. 配置SSH服务
 echo "3️⃣ 配置SSH服务..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq openssh-server
@@ -53,11 +49,10 @@ sudo systemctl restart ssh
 # 配置SSH公钥
 if [ -n "$SSH_PUBLIC_KEY" ]; then
     echo "配置SSH公钥..."
-    sudo mkdir -p /home/$CLUSTER_USER/.ssh
-    echo "$SSH_PUBLIC_KEY" | sudo tee /home/$CLUSTER_USER/.ssh/authorized_keys
-    sudo chown -R $CLUSTER_USER:$CLUSTER_USER /home/$CLUSTER_USER/.ssh
-    sudo chmod 700 /home/$CLUSTER_USER/.ssh
-    sudo chmod 600 /home/$CLUSTER_USER/.ssh/authorized_keys
+    sudo mkdir -p /root/.ssh
+    echo "$SSH_PUBLIC_KEY" | sudo tee /root/.ssh/authorized_keys
+    sudo chmod 700 /root/.ssh
+    sudo chmod 600 /root/.ssh/authorized_keys
     echo "✅ SSH公钥已配置"
 fi
 
@@ -65,7 +60,6 @@ fi
 echo "4️⃣ 安装Docker..."
 if ! command -v docker &> /dev/null; then
     curl -fsSL https://get.docker.com | sh
-    sudo usermod -aG docker "$CLUSTER_USER"
 fi
 echo "Docker版本: $(docker --version)"
 
@@ -100,12 +94,12 @@ echo "========================================"
 echo "✅ $NODE_NAME 配置完成！"
 echo "========================================"
 echo "📌 主机名: $NODE_NAME"
-echo "📌 用户名: $CLUSTER_USER"
+echo "📌 用户名: root"
 echo "📌 密码: $CLUSTER_PASSWORD"
 if [ -n "$TS_IP" ]; then
     echo "📌 Tailscale IP: $TS_IP"
     echo ""
-    echo "SSH访问: ssh $CLUSTER_USER@$TS_IP"
+    echo "SSH访问: ssh root@$TS_IP"
 fi
 echo ""
 echo "下一步操作:"
