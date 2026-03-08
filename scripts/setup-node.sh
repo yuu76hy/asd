@@ -10,49 +10,103 @@ fi
 NODE_NUM=$1
 NODE_NAME="docker${NODE_NUM}"
 
-if [ -z "$TS_AUTH_KEY" ]; then
-    echo "错误: 请设置环境变量 TS_AUTH_KEY"
-    echo "示例: export TS_AUTH_KEY=tskey-auth-xxxxx-xxxxx"
-    exit 1
-fi
+# 从环境变量或使用默认值
+CLUSTER_USER=${CLUSTER_USER:-dockeradmin}
+CLUSTER_PASSWORD=${CLUSTER_PASSWORD:-dockeradmin123}
+TS_AUTH_KEY=${TS_AUTH_KEY:-}
+SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
 
 echo "========================================"
 echo "🔧 开始配置 $NODE_NAME..."
 echo "========================================"
+echo "用户: $CLUSTER_USER"
+echo "密码: $CLUSTER_PASSWORD"
+echo "========================================"
 
+# 1. 设置系统主机名
 echo "1️⃣ 设置系统主机名..."
 sudo hostnamectl set-hostname "$NODE_NAME"
 echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
 
-echo "2️⃣ 安装Docker..."
+# 2. 创建用户
+echo "2️⃣ 创建系统用户..."
+if ! id "$CLUSTER_USER" &>/dev/null; then
+    sudo useradd -m -s /bin/bash "$CLUSTER_USER"
+    echo "$CLUSTER_USER:$CLUSTER_PASSWORD" | sudo chpasswd
+    sudo usermod -aG docker,sudo "$CLUSTER_USER"
+    echo "✅ 用户 $CLUSTER_USER 已创建"
+else
+    echo "$CLUSTER_USER:$CLUSTER_PASSWORD" | sudo chpasswd
+    echo "✅ 用户 $CLUSTER_USER 密码已更新"
+fi
+
+# 3. 配置SSH
+echo "3️⃣ 配置SSH服务..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq openssh-server
+sudo systemctl enable --now ssh
+
+sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sudo systemctl restart ssh
+
+# 配置SSH公钥
+if [ -n "$SSH_PUBLIC_KEY" ]; then
+    echo "配置SSH公钥..."
+    sudo mkdir -p /home/$CLUSTER_USER/.ssh
+    echo "$SSH_PUBLIC_KEY" | sudo tee /home/$CLUSTER_USER/.ssh/authorized_keys
+    sudo chown -R $CLUSTER_USER:$CLUSTER_USER /home/$CLUSTER_USER/.ssh
+    sudo chmod 700 /home/$CLUSTER_USER/.ssh
+    sudo chmod 600 /home/$CLUSTER_USER/.ssh/authorized_keys
+    echo "✅ SSH公钥已配置"
+fi
+
+# 4. 安装Docker
+echo "4️⃣ 安装Docker..."
 if ! command -v docker &> /dev/null; then
     curl -fsSL https://get.docker.com | sh
-    sudo usermod -aG docker "$USER"
-    newgrp docker 2>/dev/null || true
+    sudo usermod -aG docker "$CLUSTER_USER"
 fi
 echo "Docker版本: $(docker --version)"
 
-echo "3️⃣ 安装Tailscale..."
+# 5. 安装Tailscale
+echo "5️⃣ 安装Tailscale..."
 if ! command -v tailscale &> /dev/null; then
     curl -fsSL https://tailscale.com/install.sh | sh
 fi
-sudo tailscale up --authkey "$TS_AUTH_KEY" --hostname "$NODE_NAME" --accept-dns=false
-TS_IP=$(tailscale ip | grep "100.64" | head -1)
-echo "Tailscale IP: $TS_IP"
 
-echo "4️⃣ 安装GlusterFS..."
-sudo apt-get update -qq
+if [ -n "$TS_AUTH_KEY" ]; then
+    sudo tailscale up --authkey "$TS_AUTH_KEY" --hostname "$NODE_NAME" --accept-dns=false
+    TS_IP=$(tailscale ip | grep "100.64" | head -1)
+    echo "Tailscale IP: $TS_IP"
+else
+    echo "⚠️ 未设置TS_AUTH_KEY，请手动连接Tailscale"
+fi
+
+# 6. 安装GlusterFS
+echo "6️⃣ 安装GlusterFS..."
 sudo apt-get install -y -qq glusterfs-server glusterfs-client
 sudo systemctl enable --now glusterd
 
-echo "5️⃣ 创建GlusterFS数据目录..."
+# 7. 创建GlusterFS数据目录
+echo "7️⃣ 创建GlusterFS数据目录..."
 sudo mkdir -p /gluster/data
+
+# 8. 创建挂载点
+echo "8️⃣ 创建挂载点..."
+sudo mkdir -p /mnt/gluster
 
 echo "========================================"
 echo "✅ $NODE_NAME 配置完成！"
 echo "========================================"
-echo "📌 Tailscale IP: $TS_IP"
 echo "📌 主机名: $NODE_NAME"
+echo "📌 用户名: $CLUSTER_USER"
+echo "📌 密码: $CLUSTER_PASSWORD"
+if [ -n "$TS_IP" ]; then
+    echo "📌 Tailscale IP: $TS_IP"
+    echo ""
+    echo "SSH访问: ssh $CLUSTER_USER@$TS_IP"
+fi
 echo ""
 echo "下一步操作:"
 if [ "$NODE_NUM" -eq 1 ]; then
