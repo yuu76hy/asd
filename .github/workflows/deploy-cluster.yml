@@ -57,24 +57,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         
-      - name: Create all 5 Codespaces
+      - name: Create all Codespaces
         if: github.event.inputs.action == 'create-all'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          echo "开始创建5个Codespaces..."
-          for i in 1 2 3 4 5; do
+          echo "开始创建2个Codespaces..."
+          for i in 1 2; do
             echo "创建 docker$i..."
             RESPONSE=$(curl -s -X POST \
               -H "Authorization: token $GH_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ github.repository }}/codespaces" \
-              -d "{
-                \"ref\": \"main\",
-                \"location\": \"WestUs\",
-                \"machine\": \"basicLinux32gb\",
-                \"display_name\": \"docker$i\"
-              }")
+              -d "{\n                \"ref\": \"main\",\n                \"display_name\": \"docker$i\"\n              }")
             
             if echo "$RESPONSE" | grep -q '"id"'; then
               CODESPACE_ID=$(echo "$RESPONSE" | jq -r '.id')
@@ -96,12 +91,7 @@ jobs:
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/codespaces" \
-            -d "{
-              \"ref\": \"main\",
-              \"location\": \"WestUs\",
-              \"machine\": \"basicLinux32gb\",
-              \"display_name\": \"docker-new-$(date +%H%M)\"
-            }")
+            -d "{\n              \"ref\": \"main\",\n              \"display_name\": \"docker-new-$(date +%H%M)\"\n            }")
           echo "$RESPONSE" | jq '.'
           
   check-status:
