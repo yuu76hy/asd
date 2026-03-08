@@ -16,14 +16,10 @@ on:
   push:
     branches:
       - main
-    paths:
-      - '.github/workflows/deploy-cluster.yml'
-      - 'scripts/**'
 
 jobs:
   test-scripts:
     runs-on: ubuntu-latest
-    if: github.event.inputs.action == 'test' || github.event_name == 'push'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,28 +28,31 @@ jobs:
         run: |
           echo "测试脚本语法..."
           for script in scripts/*.sh; do
-            echo "检查 $script"
-            bash -n "$script" || exit 1
+            if [ -f "$script" ]; then
+              echo "检查 $script"
+              bash -n "$script" || exit 1
+            fi
           done
           echo "✅ 所有脚本语法正确"
           
       - name: Test Docker installation
         run: |
           echo "测试Docker安装..."
-          curl -fsSL https://get.docker.com | sh
+          curl -fsSL https://get.docker.com | sudo sh
           docker --version
           echo "✅ Docker安装成功"
           
       - name: Test Tailscale installation
         run: |
           echo "测试Tailscale安装..."
-          curl -fsSL https://tailscale.com/install.sh | sh
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
           tailscale version || echo "Tailscale已安装"
           echo "✅ Tailscale安装成功"
 
   create-codespaces:
     runs-on: ubuntu-latest
-    if: github.event.inputs.action == 'create-all' || github.event.inputs.action == 'create-one'
+    needs: test-scripts
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.action == 'create-all' || github.event.inputs.action == 'create-one')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -87,10 +86,6 @@ jobs:
             
             sleep 3
           done
-          echo ""
-          echo "========================================"
-          echo "Codespaces创建完成，等待启动..."
-          echo "========================================"
           
       - name: Create single Codespace
         if: github.event.inputs.action == 'create-one'
@@ -111,7 +106,7 @@ jobs:
           
   check-status:
     runs-on: ubuntu-latest
-    if: github.event.inputs.action == 'status'
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'status'
     steps:
       - name: Check Codespaces status
         env:
