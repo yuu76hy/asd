@@ -42,7 +42,6 @@ jobs:
       - name: Install Docker
         run: |
           curl -fsSL https://get.docker.com | sudo sh
-          sudo usermod -aG docker $USER
           
       - name: Install Tailscale
         env:
@@ -51,29 +50,31 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sudo sh
           sudo tailscale up --authkey "$TS_AUTH_KEY" --hostname "docker${{ steps.detect.outputs.NEXT_NUM }}" --accept-dns=false
           
-      - name: Create cluster user
+      - name: Configure root user
         env:
-          CLUSTER_USER: ${{ secrets.CLUSTER_USER }}
           CLUSTER_PASSWORD: ${{ secrets.CLUSTER_PASSWORD }}
         run: |
           NEXT_NUM=${{ steps.detect.outputs.NEXT_NUM }}
           NODE_NAME="docker${NEXT_NUM}"
-          USER=${CLUSTER_USER:-dockeradmin}
-          PASS=${CLUSTER_PASSWORD:-dockeradmin123}
+          PASS=${CLUSTER_PASSWORD:-root123456}
           
           sudo hostnamectl set-hostname "$NODE_NAME"
           echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
           
-          sudo useradd -m -s /bin/bash "$USER" || true
-          echo "$USER:$PASS" | sudo chpasswd
-          sudo usermod -aG docker,sudo "$USER"
+          # 设置root密码
+          echo "root:$PASS" | sudo chpasswd
           
+          # 配置SSH允许root登录
           sudo apt-get install -y openssh-server
           sudo systemctl enable --now ssh
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo systemctl restart ssh
           
-          echo "用户配置完成: $USER / $PASS"
+          echo "root用户配置完成，密码: $PASS"
           
       - name: Join Swarm cluster
         env:
@@ -102,10 +103,10 @@ jobs:
             ROLE="worker"
           fi
           
-          JOIN_TOKEN=$(ssh -o StrictHostKeyChecking=no docker@"$MANAGER_IP" "docker swarm join-token $ROLE -q" 2>/dev/null || echo "")
+          JOIN_TOKEN=$(ssh -o StrictHostKeyChecking=no root@"$MANAGER_IP" "docker swarm join-token $ROLE -q" 2>/dev/null || echo "")
           
           if [ -z "$JOIN_TOKEN" ]; then
-            echo "警告: 无法获取加入令牌，尝试使用存储的令牌"
+            echo "警告: 无法获取加入令牌"
             exit 1
           fi
           
