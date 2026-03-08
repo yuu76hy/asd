@@ -51,15 +51,36 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sudo sh
           sudo tailscale up --authkey "$TS_AUTH_KEY" --hostname "docker${{ steps.detect.outputs.NEXT_NUM }}" --accept-dns=false
           
+      - name: Create cluster user
+        env:
+          CLUSTER_USER: ${{ secrets.CLUSTER_USER }}
+          CLUSTER_PASSWORD: ${{ secrets.CLUSTER_PASSWORD }}
+        run: |
+          NEXT_NUM=${{ steps.detect.outputs.NEXT_NUM }}
+          NODE_NAME="docker${NEXT_NUM}"
+          USER=${CLUSTER_USER:-dockeradmin}
+          PASS=${CLUSTER_PASSWORD:-dockeradmin123}
+          
+          sudo hostnamectl set-hostname "$NODE_NAME"
+          echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
+          
+          sudo useradd -m -s /bin/bash "$USER" || true
+          echo "$USER:$PASS" | sudo chpasswd
+          sudo usermod -aG docker,sudo "$USER"
+          
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          
+          echo "用户配置完成: $USER / $PASS"
+          
       - name: Join Swarm cluster
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           NEXT_NUM=${{ steps.detect.outputs.NEXT_NUM }}
           NODE_NAME="docker${NEXT_NUM}"
-          
-          sudo hostnamectl set-hostname "$NODE_NAME"
-          echo "127.0.0.1 $NODE_NAME" | sudo tee -a /etc/hosts
           
           MANAGER_IPS=("100.64.0.1" "100.64.0.3" "100.64.0.5")
           
