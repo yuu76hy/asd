@@ -1,0 +1,76 @@
+name: Docker集群-节点3-Worker
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [start_node3]
+
+jobs:
+  node3-worker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      NODE_ID: "3"
+      NODE_NAME: "docker3"
+      NODE_ROLE: "worker"
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      REPO: ${{ secrets.REPO }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RUN_MINUTES: 300
+
+    steps:
+      - name: 1-系统初始化
+        run: |
+          sudo apt update -y -qq
+          sudo apt install -y -qq curl wget jq sshpass openssh-server
+          sudo systemctl enable --now ssh
+          echo "root:$ROOTS_PASSWORD" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+      - name: 2-安装Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker root
+          sudo systemctl enable --now docker
+
+      - name: 3-Tailscale组网
+        run: |
+          [ -z "$TAILSCALE_AUTH_KEY" ] && exit 0
+          curl -fsSL https://tailscale.com/install.sh | sudo bash
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$NODE_NAME" --reset
+          TS_IP=$(sudo tailscale ip -4)
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4-加入集群
+        run: |
+          sleep 60
+          TS_STATUS=$(sudo tailscale status --json 2>/dev/null)
+          MANAGER_IP=$(echo "$TS_STATUS" | jq -r '.Peer[] | select(.HostName == "docker1") | .TailscaleIPs[0]' 2>/dev/null | head -1)
+          if [ -n "$MANAGER_IP" ]; then
+            WORKER_TOKEN=$(sshpass -p "$ROOTS_PASSWORD" ssh -o StrictHostKeyChecking=no root@$MANAGER_IP "cat /cluster-backup/worker-token.txt" 2>/dev/null)
+            [ -n "$WORKER_TOKEN" ] && docker swarm join --token $WORKER_TOKEN $MANAGER_IP:2377
+          fi
+          docker node ls
+
+      - name: 5-稳定运行
+        run: |
+          ELAPSED=0
+          while [ $ELAPSED -lt $((RUN_MINUTES * 60)) ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+            echo "[节点3] 运行: $((ELAPSED / 60))分钟"
+          done
+
+      - name: 6-触发续跑
+        run: |
+          [ -z "$USER_PAT" ] && exit 0
+          curl -s -X POST -H "Authorization: token $USER_PAT" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/$REPO/dispatches \
+            -d '{"event_type":"start_node4"}'
+
+      - name: 7-清理
+        if: always()
+        run: sudo systemctl stop tailscaled 2>/dev/null || true

@@ -1,0 +1,137 @@
+name: Docker集群-节点1-Manager
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [start_node1, renew_cluster]
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时触发
+
+jobs:
+  node1-manager:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      NODE_ID: "1"
+      NODE_NAME: "docker1"
+      NODE_ROLE: "manager"
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      REPO: ${{ secrets.REPO }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RUN_MINUTES: 300
+      BACKUP_DIR: "/cluster-backup"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 1-系统初始化
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 系统初始化 ====="
+          sudo apt update -y -qq
+          sudo apt install -y -qq curl wget jq sshpass openssh-server zstd
+          sudo systemctl enable --now ssh
+          echo "root:$ROOTS_PASSWORD" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          echo "✅ 系统初始化完成"
+
+      - name: 2-安装Docker
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 安装Docker ====="
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker root
+          sudo systemctl enable --now docker
+          docker --version
+          echo "✅ Docker安装完成"
+
+      - name: 3-Tailscale组网
+        run: |
+          set +e
+          echo "===== [节点1-Manager] Tailscale组网 ====="
+          [ -z "$TAILSCALE_AUTH_KEY" ] && exit 0
+          curl -fsSL https://tailscale.com/install.sh | sudo bash
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$NODE_NAME" --reset
+          TS_IP=$(sudo tailscale ip -4)
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          echo "节点IP: $TS_IP"
+          echo "✅ Tailscale组网完成"
+
+      - name: 4-初始化Swarm集群
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 初始化Swarm ====="
+          if ! docker info 2>/dev/null | grep -q "Swarm: active"; then
+            docker swarm init --advertise-addr $TS_IP
+            MANAGER_TOKEN=$(docker swarm join-token manager -q)
+            WORKER_TOKEN=$(docker swarm join-token worker -q)
+            echo "MANAGER_TOKEN=$MANAGER_TOKEN" >> $GITHUB_ENV
+            echo "WORKER_TOKEN=$WORKER_TOKEN" >> $GITHUB_ENV
+            # 保存token到文件供其他节点获取
+            sudo mkdir -p $BACKUP_DIR
+            echo "$MANAGER_TOKEN" | sudo tee $BACKUP_DIR/manager-token.txt
+            echo "$WORKER_TOKEN" | sudo tee $BACKUP_DIR/worker-token.txt
+            echo "$TS_IP" | sudo tee $BACKUP_DIR/manager-ip.txt
+          fi
+          docker node ls
+          echo "✅ Swarm初始化完成"
+
+      - name: 5-等待其他节点加入
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 等待节点加入 ====="
+          for i in {1..30}; do
+            NODE_COUNT=$(docker node ls --format '{{.ID}}' | wc -l)
+            echo "当前节点数: $NODE_COUNT / 5"
+            [ $NODE_COUNT -ge 2 ] && break
+            sleep 30
+          done
+          docker node ls
+          echo "✅ 节点检查完成"
+
+      - name: 6-部署服务
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 部署服务 ====="
+          # 部署测试服务
+          docker service create --name nginx-test --publish 8080:80 --replicas 3 nginx:alpine || true
+          docker service ls
+          echo "✅ 服务部署完成"
+
+      - name: 7-稳定运行
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 稳定运行 $RUN_MINUTES 分钟 ====="
+          ELAPSED=0
+          while [ $ELAPSED -lt $((RUN_MINUTES * 60)) ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+            REMAINING=$((RUN_MINUTES - ELAPSED / 60))
+            NODE_COUNT=$(docker node ls --format '{{.ID}}' 2>/dev/null | wc -l)
+            SERVICE_COUNT=$(docker service ls --format '{{.Name}}' 2>/dev/null | wc -l)
+            echo "[节点1] 运行: $((ELAPSED / 60))分钟 | 剩余: ${REMAINING}分钟 | 节点: $NODE_COUNT | 服务: $SERVICE_COUNT"
+          done
+          echo "✅ 稳定运行完成"
+
+      - name: 8-触发续跑
+        run: |
+          set +e
+          echo "===== [节点1-Manager] 触发续跑 ====="
+          [ -z "$USER_PAT" ] && exit 0
+          # 触发节点2续跑
+          curl -s -X POST -H "Authorization: token $USER_PAT" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/$REPO/dispatches \
+            -d '{"event_type":"start_node2"}'
+          echo "✅ 续跑触发完成"
+
+      - name: 9-清理
+        if: always()
+        run: |
+          sudo systemctl stop tailscaled 2>/dev/null || true
+          sudo rm -rf /tmp/* $BACKUP_DIR 2>/dev/null || true
+          echo "✅ 清理完成"
